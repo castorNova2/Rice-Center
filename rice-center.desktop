@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Rice Center
+GenericName=Rice settings
+Comment=See and manage every rice feature: toggles, settings, looks and backups
+Exec=sh -c '"$HOME/kde-rice/bin/rice-center"'
+Icon=preferences-desktop-theme-global
+Terminal=false
+Categories=Settings;DesktopSettings;Qt;KDE;
+Keywords=rice;theme;look;toggle;backup;snapshot;
+StartupNotify=true
+X-KDE-Shortcuts=Meta+Alt+R

@@ -1,0 +1,1061 @@
+#!/usr/bin/python3 -I
+# kde-rice: rice-ctl - one control point for every rice feature (backend of the Rice Center app).
+#   rice-ctl list [--json]            every feature with its live state
+#   rice-ctl get <id>                 one feature (JSON)
+#   rice-ctl on|off <id>              turn a feature on / off (prints the feature as JSON)
+#   rice-ctl set <id> <value>         choose a value (choice features)
+#   rice-ctl set <id> <key> <value>   change a setting of a feature
+#   rice-ctl action <id> <action> [arg]   run an action (snapshot, restore, doctor, ...)
+#   rice-ctl help <id>                that feature's section of ~/kde-rice/USAGE.md
+#   rice-ctl look rice|stock|original [--layout]   switch the whole look (reversible, snapshot first)
+# Every change uses the documented on/off commands of the rice (USAGE.md / BACKUP-RESTORE.md).
+# sudo is never run silently: such actions open Konsole so the password prompt is visible.
+import json
+import os
+import pathlib
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+H = pathlib.Path.home()
+RICE = H / "kde-rice"
+BIN = RICE / "bin"
+CFG = H / ".config"
+KR = CFG / "kde-rice"
+CACHE = H / ".cache/kde-rice"
+UNITDIR = CFG / "systemd/user"
+LOOK_STATE = KR / "look-state.json"
+LITE_FLAG = CACHE / "lite"
+DOCTOR_CACHE = CACHE / "rice-center-doctor.txt"
+USAGE = RICE / "USAGE.md"
+
+
+# ------------------------------------------------------------------------------------------- helpers
+def sh(cmd, timeout=20, check=False):
+    """Run a command (list or shell string); return (rc, stdout+stderr)."""
+    try:
+        r = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True, timeout=timeout)
+        out = (r.stdout + (("\n" + r.stderr) if r.stderr.strip() else "")).strip()
+        if check and r.returncode != 0:
+            raise RuntimeError(out or f"exit {r.returncode}")
+        return r.returncode, out
+    except subprocess.TimeoutExpired:
+        if check:
+            raise RuntimeError("timed out")
+        return 124, "timed out"
+
+
+def detach(cmd):
+    subprocess.Popen(cmd, shell=isinstance(cmd, str), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+def konsole(cmd, hold=True):
+    detach(["konsole"] + (["--hold"] if hold else []) + ["-e", "bash", "-lc", cmd])
+
+
+def kread(f, group, key, default=""):
+    args = ["kreadconfig6", "--file", f]
+    for g in group if isinstance(group, (list, tuple)) else [group]:
+        args += ["--group", g]
+    rc, out = sh(args + ["--key", key, "--default", default], timeout=5)
+    return out if rc == 0 else default
+
+
+def kwrite(f, group, key, value, notify=True):
+    """Write a KDE config key (value None = delete it, back to Plasma's default). --notify tells running apps."""
+    args = ["kwriteconfig6", "--file", f] + (["--notify"] if notify else [])
+    for g in group if isinstance(group, (list, tuple)) else [group]:
+        args += ["--group", g]
+    if value is None:
+        sh(args + ["--key", key, "--delete"], timeout=5, check=True)
+    elif isinstance(value, bool):
+        sh(args + ["--type", "bool", "--key", key, "true" if value else "false"], timeout=5, check=True)
+    else:
+        sh(args + ["--key", key, str(value)], timeout=5, check=True)
+
+
+def readkv(path):
+    d = {}
+    try:
+        for line in pathlib.Path(path).read_text().splitlines():
+            k, _, v = line.partition("=")
+            if k.strip():
+                d[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return d
+
+
+_bus = None
+
+
+def bus():
+    global _bus
+    if _bus is None:
+        import dbus
+        _bus = dbus.SessionBus()
+    return _bus
+
+
+def dcall(service, path, iface, method, *args, default=None):
+    try:
+        import dbus
+        return getattr(dbus.Interface(bus().get_object(service, path), iface), method)(*args)
+    except Exception:
+        return default
+
+
+# ---- systemd user units (batched) ----
+_units = {}
+
+
+def load_units(names):
+    names = [n for n in names if n not in _units]
+    if not names:
+        return
+    _, act = sh(["systemctl", "--user", "is-active"] + names, timeout=10)
+    _, ena = sh(["systemctl", "--user", "is-enabled"] + names, timeout=10)
+    a, e = act.splitlines(), ena.splitlines()
+    for i, n in enumerate(names):
+        _units[n] = (a[i] if i < len(a) else "unknown", e[i] if i < len(e) else "unknown")
+
+
+def unit_on(u):
+    st = _units.get(u)
+    return bool(st) and (st[0] in ("active", "activating") or (u.endswith(".service") and st[1] == "enabled"))
+
+
+def unit_link(u):
+    """Keep linked rice units installed (systemctl disable removes the link of a linked unit file)."""
+    src = RICE / "systemd" / u
+    dst = UNITDIR / u
+    if src.exists() and not dst.exists():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.symlink_to(src)
+        sh(["systemctl", "--user", "daemon-reload"])
+
+
+def units_set(units, on):
+    for u in units:
+        unit_link(u)
+        if on:
+            sh(["systemctl", "--user", "reset-failed", u])
+            sh(["systemctl", "--user", "enable", "--now", u], check=True)
+        else:
+            sh(["systemctl", "--user", "disable", "--now", u])
+            unit_link(u)
+    _units.clear()
+
+
+# ---- KWin effects and scripts ----
+def kwin_enabled(plugin):
+    return kread("kwinrc", "Plugins", plugin + "Enabled", "false") == "true"
+
+
+def effect_loaded(e):
+    return bool(dcall("org.kde.KWin", "/Effects", "org.kde.kwin.Effects", "isEffectLoaded", e, default=False))
+
+
+def script_loaded(s):
+    return bool(dcall("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "isScriptLoaded", s, default=False))
+
+
+def effect_set(e, on):
+    kwrite("kwinrc", "Plugins", e + "Enabled", "true" if on else "false")
+    dcall("org.kde.KWin", "/Effects", "org.kde.kwin.Effects", "loadEffect" if on else "unloadEffect", e)
+
+
+def script_set(s, on):
+    kwrite("kwinrc", "Plugins", s + "Enabled", "true" if on else "false")
+    if not on:
+        dcall("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "unloadScript", s)
+    dcall("org.kde.KWin", "/KWin", "org.kde.KWin", "reconfigure")
+    if on:
+        dcall("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "start")
+
+
+# ---- global shortcuts (kglobalaccel, desktop-file components) ----
+META, ALT, CTRL, SHIFT = 0x10000000, 0x08000000, 0x04000000, 0x02000000
+SHORTCUTS = {   # id: (desktop file, friendly name, key code, label)
+    "key-quickmenu": ("rice-powermenu.desktop", "Rice Quick Menu", META | ALT | 0x58, "Meta+Alt+X"),
+    "key-cheatsheet": ("rice-cheatsheet.desktop", "Rice Cheat Sheet", META | 0x2F, "Meta+/"),
+    "key-taskmanager": ("rice-taskmanager.desktop", "Rice Task Manager", CTRL | SHIFT | 0x01000000, "Ctrl+Shift+Esc"),
+    "key-ricecenter": ("rice-center.desktop", "Rice Center", META | ALT | 0x52, "Meta+Alt+R"),
+}
+
+
+def shortcut_get(fid):
+    f, name, _, _ = SHORTCUTS[fid]
+    keys = dcall("org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel", "shortcut",
+                 [f, "_launch", name, name], default=None)
+    return bool(keys) and any(int(k) for k in keys)
+
+
+def shortcut_set(fid, on):
+    import dbus
+    f, name, key, _ = SHORTCUTS[fid]
+    aid = dbus.Array([f, "_launch", name, name], signature="s")
+    dcall("org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel", "doRegister", aid)
+    keys = dbus.Array([dbus.Int32(key)] if on else [], signature="i")
+    dcall("org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel", "setShortcut", aid, keys, dbus.UInt32(0))
+
+
+# ---- Plasma ----
+def plasma_eval(js):
+    return sh(["qdbus6", "org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", js], timeout=10)[1]
+
+
+def restart_plasma():
+    sh(["systemctl", "--user", "restart", "plasma-plasmashell.service"], timeout=60)
+
+
+def run_bin(name, *args, timeout=60):
+    return sh([str(BIN / name)] + list(args), timeout=timeout)
+
+
+# ------------------------------------------------------------------------------------------- looks
+LOOK_UNITS = ["rice-daynight.timer", "rice-lockscreen.path", "rice-gtk.path"]   # paused while not on the rice look
+# everything the stock / original looks may rewrite (Breeze look-and-feel writes kdedefaults too), so the
+# snapshot taken before leaving the rice brings ALL of it back
+LOOK_PATHS = [".config/" + n for n in ("dolphinrc", "gtk-3.0", "gtk-4.0", "gtkrc", "gtkrc-2.0", "kcminputrc",
+              "kdedefaults", "kdeglobals", "konsolerc", "kwinrc", "kwinrulesrc", "plasma-localerc",
+              "plasma-org.kde.plasma.desktop-appletsrc", "plasmashellrc", "xsettingsd", "kscreenlockerrc",
+              "ksplashrc", "plasmarc", "breezerc", "darklyrc")]
+
+
+def current_look():
+    try:
+        return json.loads(LOOK_STATE.read_text()).get("look", "rice")
+    except (OSError, ValueError):
+        return "rice"
+
+
+def look_switch(target, layout=False):
+    cur = current_look()
+    if target == cur:
+        return f"already on the {target} look"
+    log = []
+    if target == "rice":
+        st = json.loads(LOOK_STATE.read_text())
+        snap = RICE / "backups" / st["snapshot"]
+        # the snapshot also holds ~/.config/kde-rice (to-do list, mood, settings): keep today's copy of that
+        keep = pathlib.Path(sh(["mktemp", "-d"])[1])
+        sh(["cp", "-a", str(KR) + "/.", str(keep)])
+        sh(["systemctl", "--user", "stop", "plasma-plasmashell.service"], timeout=30)
+        rc, out = sh(["bash", str(snap / "restore-this-state.sh")], timeout=120)
+        log.append(out)
+        sh(["cp", "-a", str(keep) + "/.", str(KR)])
+        sh(["rm", "-rf", str(keep)])
+        sh(["systemctl", "--user", "daemon-reload"])
+        units_set(st.get("units", []), True)
+        for s in st.get("scripts", []):
+            script_set(s, True)
+        for e in st.get("effects", []):
+            effect_set(e, True)
+        sh(["plasma-apply-colorscheme", "MidnightBlue"]); sh(["plasma-apply-desktoptheme", "rice"])
+        sh(["plasma-apply-cursortheme", "Bibata-Modern-Ice"]); sh(["/usr/libexec/plasma-changeicons", "Papirus-Dark"])
+        run_bin("rice-gtk")
+        sh(["systemctl", "--user", "start", "plasma-plasmashell.service"], timeout=30)
+        dcall("org.kde.KWin", "/KWin", "org.kde.KWin", "reconfigure")
+        LOOK_STATE.unlink(missing_ok=True)
+        return "back to the rice (snapshot " + st["snapshot"] + " restored, services back on)"
+
+    if cur != "rice":                     # stock <-> original: go back to the rice first, then switch
+        log.append(look_switch("rice"))
+    # leaving the rice: snapshot + remember what to turn back on
+    rc, out = run_bin("rice-backup", "look-rice", *LOOK_PATHS, timeout=180)
+    m = re.search(r"backups/(\d+-pre-look-rice)", out)
+    if not m:
+        raise RuntimeError("snapshot failed, nothing changed:\n" + out)
+    load_units(LOOK_UNITS)
+    st = {"look": target, "snapshot": m.group(1), "made": time.strftime("%Y-%m-%d %H:%M"),
+          "units": [u for u in LOOK_UNITS if unit_on(u)], "scripts": [], "effects": []}
+    KR.mkdir(parents=True, exist_ok=True)
+    LOOK_STATE.write_text(json.dumps(st, indent=1))
+    units_set(st["units"], False)
+    run_bin("rice-gtk", "off")
+    if target == "stock":
+        for e in ("rice-tide", "kwin4_effect_shapecorners"):
+            if kwin_enabled(e):
+                st["effects"].append(e)
+                effect_set(e, False)
+        LOOK_STATE.write_text(json.dumps(st, indent=1))
+        args = ["plasma-apply-lookandfeel", "--apply", "org.kde.breezedark.desktop"] + (["--resetLayout"] if layout else [])
+        log.append(sh(args, timeout=60)[1])
+        kwrite("ksplashrc", "KSplash", "Theme", "org.kde.breeze.desktop")
+        sh(["plasma-apply-cursortheme", "breeze_cursors"])
+        dcall("org.kde.KWin", "/KWin", "org.kde.KWin", "reconfigure")
+        return "stock KDE look applied (Breeze Dark). Back with: Back to the rice"
+    # original: the 2026-11-09 configs from backups/1-original, without deleting any rice files
+    orig = RICE / "backups/1-original/config"
+    sh(["systemctl", "--user", "stop", "plasma-plasmashell.service"], timeout=30)
+    for f in orig.iterdir():
+        dst = CFG / f.name
+        if f.is_dir():
+            sh(["cp", "-a", str(f) + "/.", str(dst)])
+        else:
+            sh(["cp", "-a", str(f), str(dst)])
+    kwrite("ksplashrc", "KSplash", "Theme", "org.kde.breeze.desktop")
+    sh(["plasma-apply-colorscheme", "BreezeDark"]); sh(["/usr/libexec/plasma-changeicons", "breeze-dark"])
+    sh(["plasma-apply-cursortheme", "breeze_cursors"])
+    sh(["systemctl", "--user", "start", "plasma-plasmashell.service"], timeout=30)
+    time.sleep(2)
+    sh(["plasma-apply-desktoptheme", "default"])
+    dcall("org.kde.KWin", "/KWin", "org.kde.KWin", "reconfigure")
+    return "original look (before the ricing) applied. Rice files are kept; back with: Back to the rice"
+
+
+# ------------------------------------------------------------------------------------------- everyday (QoL) settings
+def reload_cfg(f):
+    """Make running Plasma pick up a config change (on top of kwriteconfig6 --notify)."""
+    if f == "kwinrc":
+        dcall("org.kde.KWin", "/KWin", "org.kde.KWin", "reconfigure")
+    elif f == "kscreenlockerrc":
+        dcall("org.freedesktop.ScreenSaver", "/ScreenSaver", "org.kde.screensaver", "configure")
+    elif f == "powerdevilrc":
+        dcall("org.kde.Solid.PowerManagement", "/org/kde/Solid/PowerManagement", "org.kde.Solid.PowerManagement",
+              "reparseConfiguration")
+    elif f == "kxkbrc":
+        sh(["dbus-send", "--session", "--type=signal", "/Layouts", "org.kde.keyboard.reloadConfig"])
+
+
+# id: (file, groups, key, kind, on/off or options, default value when the key is missing, title, desc, section)
+CFG_FEATURES = {
+    "sys-sounds":    ("kdeglobals", ["Sounds"], "Enable", "toggle", ("true", "false"), "true",
+                      "Notification and system sounds", "Every event sound (off = silent desktop; the rice drop sound too)", "Sound"),
+    "vol-feedback":  ("plasmaparc", ["General"], "AudioFeedback", "toggle", ("true", "false"), "true",
+                      "Sound when changing volume", "The little pop at each volume step", "Sound"),
+    "vol-over100":   ("plasmaparc", ["General"], "RaiseMaximumVolume", "toggle", ("true", "false"), "false",
+                      "Allow volume above 100 %", "Up to 150 % for quiet videos", "Sound"),
+    "vol-step":      ("plasmaparc", ["General"], "VolumeStep", "choice",
+                      [["2", "2 %"], ["5", "5 % (Plasma default)"], ["10", "10 %"]], "5",
+                      "Volume step", "How much each volume key or scroll changes", "Sound"),
+    "lock-after":    ("kscreenlockerrc", ["Daemon"], "Timeout", "choice",
+                      [["3", "3 min"], ["5", "5 min (default)"], ["10", "10 min"], ["15", "15 min"], ["30", "30 min"]], "5",
+                      "Lock the screen after", "Minutes without input (StandBy shows before this)", "Screen & lock"),
+    "lock-auto":     ("kscreenlockerrc", ["Daemon"], "Autolock", "toggle", ("true", "false"), "true",
+                      "Lock automatically when idle", "Off = only lock when you ask (Meta+L)", "Screen & lock"),
+    "lock-resume":   ("kscreenlockerrc", ["Daemon"], "LockOnResume", "toggle", ("true", "false"), "true",
+                      "Lock after waking from sleep", "Ask for the password when the lid opens", "Screen & lock"),
+    "screenoff-ac":  ("powerdevilrc", ["AC", "Display"], "TurnOffDisplayIdleTimeoutSec", "choice",
+                      [["default", "Plasma default"], ["300", "5 min"], ["600", "10 min"], ["900", "15 min"], ["1800", "30 min"]],
+                      "default", "Screen off after (charger)", "Minutes without input while plugged in", "Screen & lock"),
+    "screenoff-bat": ("powerdevilrc", ["Battery", "Display"], "TurnOffDisplayIdleTimeoutSec", "choice",
+                      [["default", "Plasma default"], ["120", "2 min"], ["300", "5 min"], ["600", "10 min"]],
+                      "default", "Screen off after (battery)", "Minutes without input on battery", "Screen & lock"),
+    "lid-bat":       ("powerdevilrc", ["Battery", "SuspendAndShutdown"], "LidAction", "choice",
+                      [["default", "Plasma default (sleep)"], ["1", "Sleep"], ["32", "Lock screen"], ["64", "Turn off screen"], ["0", "Do nothing"]],
+                      "default", "When the lid closes (battery)", "", "Screen & lock"),
+    "lid-ac":        ("powerdevilrc", ["AC", "SuspendAndShutdown"], "LidAction", "choice",
+                      [["default", "Plasma default (sleep)"], ["1", "Sleep"], ["32", "Lock screen"], ["64", "Turn off screen"], ["0", "Do nothing"]],
+                      "default", "When the lid closes (charger)", "", "Screen & lock"),
+    "nightlight":    ("kwinrc", ["NightColor"], "Active", "toggle", ("true", "false"), "false",
+                      "Night Light", "Warmer colours from sunset to sunrise", "Screen & lock"),
+    "win-center":    ("kwinrc", ["Windows"], "Placement", "toggle", ("Centered", "Smart"), "Smart",
+                      "Open new windows centered", "Instead of Plasma's smart placement", "Windows & desktop"),
+    "win-ffm":       ("kwinrc", ["Windows"], "FocusPolicy", "toggle", ("FocusFollowsMouse", "ClickToFocus"), "ClickToFocus",
+                      "Focus follows the mouse", "The window under the pointer gets the keyboard", "Windows & desktop"),
+    "single-click":  ("kdeglobals", ["KDE"], "SingleClick", "toggle", ("true", "false"), "false",
+                      "Single-click opens files", "Like a web page; double-click otherwise", "Windows & desktop"),
+    "anim-speed":    ("kdeglobals", ["KDE"], "AnimationDurationFactor", "choice",
+                      [["0", "Instant"], ["0.5", "Fast"], ["0.7", "Rice (0.7×)"], ["1", "Normal"], ["1.5", "Relaxed"]], "1",
+                      "Animation speed", "All Plasma and app animations", "Windows & desktop"),
+    "login-restore": ("ksmserverrc", ["General"], "loginMode", "choice",
+                      [["default", "Fedora default"], ["restorePreviousLogout", "Reopen the last session"],
+                       ["emptySession", "Start empty"], ["restoreSavedSession", "Reopen a saved session"]], "default",
+                      "At login", "Which apps open when you log in", "Windows & desktop"),
+    "numlock":       ("kcminputrc", ["Keyboard"], "NumLock", "choice",
+                      [["0", "On"], ["1", "Off"], ["2", "Leave as it was"]], "2", "NumLock at login", "", "Keyboard & touchpad"),
+    "recent-files":  ("kdeglobals", ["RecentDocuments"], "UseRecent", "toggle", ("true", "false"), "true",
+                      "Remember recent files", "Recent files in menus and the launcher (off = more private)", "Privacy & speed"),
+}
+# Per-kind sound switches: KDE keeps "which events play a sound" per app in <app>.notifyrc ([Event/x] Action=Sound|Popup…);
+# defaults in /usr/share/knotifications6, your overrides in ~/.config. id: (title, desc, [(app, event), ...])
+SOUND_GROUPS = {
+    "snd-devices": ("Device plug / unplug sounds", "USB sticks, phones, headsets connecting or leaving",
+                    [("plasma_workspace", "deviceAdded"), ("plasma_workspace", "deviceRemoved"),
+                     ("devicenotifications", "safelyRemovable")]),
+    "snd-power": ("Charger and battery sounds", "Charger plugged / unplugged, battery low or critical",
+                  [("powerdevil", "pluggedin"), ("powerdevil", "unplugged"), ("powerdevil", "lowbattery"),
+                   ("powerdevil", "criticalbattery"), ("powerdevil", "lowperipheralbattery")]),
+    "snd-warnings": ("Warning and error sounds", "Error, warning and critical messages, print errors",
+                     [("plasma_workspace", "warning"), ("plasma_workspace", "fatalerror"), ("plasma_workspace", "catastrophe"),
+                      ("plasma_workspace", "printerror"), ("plasma_workspace", "messageWarning"),
+                      ("plasma_workspace", "messageCritical"), ("oom_notifier", "catastrophe")]),
+    "snd-dialogs": ("Dialog and beep sounds", "Information / question dialogs and the system beep",
+                    [("plasma_workspace", "messageInformation"), ("plasma_workspace", "messageQuestion"),
+                     ("plasma_workspace", "beep")]),
+    "snd-login": ("Login and logout sounds", "When the desktop starts and when you log out",
+                  [("plasma_workspace", "startkde"), ("plasma_workspace", "exitkde")]),
+    "snd-password": ("Password prompt sound", "When an app asks for your password (polkit)",
+                     [("polkit-kde-authentication-agent-1", "authenticate")]),
+    "snd-trash": ("Trash emptied sound", "", [("plasma_workspace", "Trash: emptied")]),
+    "snd-timers": ("Timer and alarm sounds", "Plasma timer widget, calendar alarms", [("plasma_applet_timer", "timerFinished"),
+                                                                                       ("kalendarac", "alarm")]),
+}
+
+
+def notifyrc_action(app, event):
+    """Effective Action of an event: your ~/.config override, else the app's default."""
+    import configparser
+    for path in (CFG / f"{app}.notifyrc", pathlib.Path(f"/usr/share/knotifications6/{app}.notifyrc")):
+        c = configparser.ConfigParser(interpolation=None, strict=False)
+        c.optionxform = str
+        try:
+            c.read(path, encoding="utf-8")
+        except Exception:
+            continue
+        if c.has_option(f"Event/{event}", "Action"):
+            return c.get(f"Event/{event}", "Action")
+    return None                                   # event not installed
+
+
+def notifyrc_default(app, event):
+    import configparser
+    c = configparser.ConfigParser(interpolation=None, strict=False)
+    c.optionxform = str
+    try:
+        c.read(f"/usr/share/knotifications6/{app}.notifyrc", encoding="utf-8")
+        return c.get(f"Event/{event}", "Action")
+    except Exception:
+        return None
+
+
+def sound_group_state(fid):
+    acts = [notifyrc_action(a, e) for a, e in SOUND_GROUPS[fid][2]]
+    acts = [x for x in acts if x is not None]
+    return bool(acts) and all("Sound" in x.split("|") for x in acts), len(acts)
+
+
+def sound_group_set(fid, on):
+    apps = set()
+    for app, event in SOUND_GROUPS[fid][2]:
+        cur = notifyrc_action(app, event)
+        if cur is None:
+            continue
+        parts = [x for x in cur.split("|") if x and x != "Sound"]
+        if on:
+            parts.insert(0, "Sound")
+        new = "|".join(parts)
+        default = notifyrc_default(app, event)
+        same = default is not None and set(new.split("|")) - {""} == set(default.split("|")) - {""}
+        kwrite(f"{app}.notifyrc", f"Event/{event}", "Action", None if same else new)   # back to default = no override
+        apps.add(app)
+    for app in apps:
+        f = CFG / f"{app}.notifyrc"
+        if f.exists() and not f.read_text().strip():
+            f.unlink()                                  # nothing overridden any more
+    for app in apps:   # same signal System Settings sends, so running apps re-read the setting
+        sh(["dbus-send", "--session", "--type=signal", "/Config", "org.kde.knotification.reparseConfiguration", f"string:{app}"])
+
+
+CAPS = [["", "Normal Caps Lock"], ["caps:escape", "Extra Escape"], ["ctrl:nocaps", "Extra Ctrl"], ["caps:none", "Disabled"]]
+
+
+def cfg_value(fid):
+    f, groups, key, kind, vals, default = CFG_FEATURES[fid][:6]
+    return kread(f, groups, key, default)
+
+
+def cfg_set(fid, value):
+    f, groups, key = CFG_FEATURES[fid][:3]
+    kwrite(f, groups, key, None if value == "default" else value)
+    reload_cfg(f)
+
+
+def touchpads():
+    try:
+        import dbus
+        m = dbus.Interface(bus().get_object("org.kde.KWin", "/org/kde/KWin/InputDevice"), "org.freedesktop.DBus.Properties")
+        out = []
+        for d in m.Get("org.kde.KWin.InputDeviceManager", "devicesSysNames"):
+            p = dbus.Interface(bus().get_object("org.kde.KWin", "/org/kde/KWin/InputDevice/" + d), "org.freedesktop.DBus.Properties")
+            if p.Get("org.kde.KWin.InputDevice", "touchpad"):
+                out.append(p)
+        return out
+    except Exception:
+        return []
+
+
+TOUCH = {   # id: (D-Bus property, kcminputrc key, title, desc)
+    "tp-tap": ("tapToClick", "TapToClick", "Tap to click", "Tap the touchpad instead of pressing it"),
+    "tp-natural": ("naturalScroll", "NaturalScroll", "Natural scrolling", "Content follows your fingers"),
+    "tp-dwt": ("disableWhileTyping", "DisableWhileTyping", "Ignore the touchpad while typing", "No accidental cursor jumps"),
+}
+
+
+def touch_get(fid):
+    tps = touchpads()
+    return bool(tps) and all(bool(p.Get("org.kde.KWin.InputDevice", TOUCH[fid][0])) for p in tps)
+
+
+def touch_set(fid, on):
+    import dbus
+    prop, key = TOUCH[fid][:2]
+    tps = touchpads()
+    if not tps:
+        raise RuntimeError("no touchpad found")
+    for p in tps:
+        g = lambda k: p.Get("org.kde.KWin.InputDevice", k)
+        p.Set("org.kde.KWin.InputDevice", prop, dbus.Boolean(on))
+        # persist the way System Settings does: kcminputrc [Libinput][vendor][product][name]
+        kwrite("kcminputrc", ["Libinput", str(int(g("vendor"))), str(int(g("product"))), str(g("name"))], key, bool(on))
+
+
+# ------------------------------------------------------------------------------------------- registry
+def F(**kw):
+    kw.setdefault("kind", "toggle")
+    kw.setdefault("detail", "")
+    kw.setdefault("settings", [])
+    kw.setdefault("actions", [])
+    kw.setdefault("help", "")
+    return kw
+
+
+def unit_feature(fid, page, title, desc, units, help_="", **kw):
+    load_units(units)
+    on = all(unit_on(u) for u in units)
+    return F(id=fid, page=page, title=title, desc=desc, on=on, units=units, help=help_,
+             detail=", ".join(f"{u}: {_units[u][0]}" for u in units) if not on else "", **kw)
+
+
+def build(only=None):
+    """All features (or just `only`), with live state."""
+    out = []
+    want = (lambda i: only is None or i == only)
+    load_units(["rice-daynight.timer", "rice-lockscreen.path", "rice-gtk.path", "rice-notify-sound.service",
+                "rice-powersave.service", "rice-autoprofile.service", "rice-update-watch.path",
+                "rice-update-login.service", "rice-perf.timer", "rice-screentime.service",
+                "rice-screentime-week.timer", "rice-standby.service"])
+
+    # ---- overview / maintenance ----
+    if want("doctor"):
+        # rice-doctor takes ~4 s, so the list shows the last result; "Check now" refreshes it
+        try:
+            rc_s, when, o = DOCTOR_CACHE.read_text().split("\n", 2)
+            rc, summ = int(rc_s), (o.strip().splitlines() or [""])[-1] + f"  (checked {when})"
+        except (OSError, ValueError):
+            rc, summ, o = 0, "not checked yet", ""
+        out.append(F(id="doctor", page="overview", kind="report", title="Health check",
+                     desc="Checks everything fragile in the rice (rice-doctor)", value=summ, on=rc == 0,
+                     detail="\n".join(l for l in o.splitlines() if "⚠️" in l or "❌" in l),
+                     actions=[{"id": "check", "label": "Check now"}, {"id": "full", "label": "Full report", "output": True}],
+                     help="## Health check"))
+    if want("look"):
+        lk = current_look()
+        made = ""
+        if lk != "rice":
+            try:
+                made = json.loads(LOOK_STATE.read_text()).get("made", "")
+            except (OSError, ValueError):
+                pass
+        names = {"rice": "the rice", "stock": "stock KDE (Breeze Dark)", "original": "the original look (before ricing)"}
+        warn = ("Changes the whole desktop look; Plasma restarts for a few seconds. A snapshot is taken first and no "
+                "rice files are deleted, so 'Back to the rice' brings everything back.")
+        out.append(F(id="look", page="backups", kind="actions", title="Desktop look",
+                     desc="Switch the whole look. Reversible: snapshot first, nothing deleted",
+                     value=f"Now: {names.get(lk, lk)}" + (f" (since {made})" if made else ""), on=None, local_settings=True,
+                     settings=[{"key": "layout", "label": "Stock KDE also resets the panel layout", "type": "bool", "value": False}],
+                     actions=[a for a in [
+                         {"id": "rice", "label": "Back to the rice", "confirm": "Restore the rice look from the snapshot taken when you left it?"},
+                         {"id": "stock", "label": "Stock KDE look (Breeze Dark)", "confirm": warn},
+                         {"id": "original", "label": "Original look (before ricing, 2026-11-09)", "confirm": warn}]
+                         if a["id"] != lk]))
+    if want("lite"):
+        out.append(F(id="lite", page="overview", title="Lite mode",
+                     desc="This session only: blur, rounded corners and window animations off (games, heavy work)",
+                     on=LITE_FLAG.exists()))
+    if want("quick"):
+        out.append(F(id="quick", page="overview", kind="actions", title="Tools", desc="", on=None,
+                     actions=[{"id": "restart-plasma", "label": "Restart Plasma", "confirm": "Panels and desktop reload for a few seconds."},
+                              {"id": "usage", "label": "How-to (USAGE.md)"},
+                              {"id": "ideas", "label": "Ideas file"},
+                              {"id": "folder", "label": "Rice folder"},
+                              {"id": "sync", "label": "Sync repos to ~/Documents/Code", "output": True}]))
+
+    # ---- look ----
+    if want("scheme"):
+        cs = kread("kdeglobals", "General", "ColorScheme", "")
+        out.append(F(id="scheme", page="look", title="Midnight Blue colours", desc="KDE colour scheme (GTK apps follow)",
+                     on=cs == "MidnightBlue", detail=f"current: {cs}" if cs != "MidnightBlue" else "", help="## Lock screen"))
+    if want("plasmastyle"):
+        ps = kread("plasmarc", "Theme", "name", "default")
+        out.append(F(id="plasmastyle", page="look", title="Rice Plasma style",
+                     desc="Rounded, translucent popups, tooltips and notifications", on=ps == "rice",
+                     detail=f"current: {ps}" if ps != "rice" else ""))
+    for fid, eff, title, desc in [
+        ("corners", "kwin4_effect_shapecorners", "Rounded corners + outline", "12 px window corners, steel-blue outline on the active window"),
+        ("blur", "blur", "Blur", "Frosted glass behind panels, popups and translucent windows"),
+        ("tide", "rice-tide", "Tide window animations", "Open rise, close ebb, minimize current, maximize swell"),
+    ]:
+        if want(fid):
+            en, ld = kwin_enabled(eff), effect_loaded(eff)
+            d = ""
+            if en and not ld:
+                d = "paused right now (Power Saver or Lite mode)"
+            out.append(F(id=fid, page="look", title=title, desc=desc, on=en, detail=d, plugin=eff))
+    if want("gtk"):
+        rc, o = run_bin("rice-gtk", "status")
+        out.append(F(id="gtk", page="look", title="GTK apps match KDE",
+                     desc="GNOME-style apps and Flatpaks get the KDE colours, window buttons and frame",
+                     on="matches KDE" in o, help="## GTK apps match"))
+    if want("splash"):
+        sp = kread("ksplashrc", "KSplash", "Theme", "")
+        out.append(F(id="splash", page="look", title="Rice login splash", desc="Blurred wallpaper, clock and greeting while logging in",
+                     on=sp == "org.rice.splash"))
+    if want("lockscreen"):
+        out.append(unit_feature("lockscreen", "look", "Lock screen = current wallpaper", "Blurred copy of the picture on screen",
+                                ["rice-lockscreen.path"], "## Lock screen",
+                                actions=[{"id": "rebuild", "label": "Rebuild now"}]))
+    if want("sounds"):
+        th = kread("kdeglobals", "Sounds", "Theme", "ocean")
+        opts = []
+        for d in (H / ".local/share/sounds", pathlib.Path("/usr/share/sounds")):
+            if d.is_dir():
+                opts += [p.name for p in sorted(d.iterdir()) if (p / "index.theme").exists()]
+        out.append(F(id="sounds", page="look", kind="choice", title="Sound theme", desc="System sounds",
+                     value=th, options=[[o, o] for o in dict.fromkeys(opts)], help="## Sounds"))
+
+    # ---- wallpaper ----
+    if want("daynight"):
+        out.append(unit_feature("daynight", "wallpaper", "Day / night wallpapers",
+                                "Slideshow switches between day and night pictures at sunrise / sunset",
+                                ["rice-daynight.timer"], "## Wallpapers",
+                                actions=[{"id": "repick", "label": "Re-pick now"}]))
+    if want("mood"):
+        rc, o = run_bin("rice-mood")
+        moods, cur = [], ""
+        for line in o.splitlines():
+            m = re.match(r"^([* ]) ([a-z0-9_-]+)\s+(\d+) images", line)
+            if m:
+                moods.append([m.group(2), f"{m.group(2).capitalize()} ({m.group(3)})"])
+                if m.group(1) == "*":
+                    cur = m.group(2)
+        out.append(F(id="mood", page="wallpaper", kind="choice", title="Wallpaper mood", desc="Which picture set the slideshow uses",
+                     value=cur, options=moods, help="## Wallpapers"))
+
+    # ---- windows & keys ----
+    for fid, scr, title, desc, hlp in [
+        ("karousel", "karousel", "Karousel tiling", "Scrolling columns on workspaces 二 and 三", "### Tiling on workspaces"),
+        ("snap", "rice-snap", "Snap Layouts + Snap Assist", "Meta+Z layout picker; fill the other half after snapping", "### Snap Layouts"),
+        ("scratch", "rice-scratch", "Scratchpad", "Meta+S hidden layer, Meta+Ctrl+S moves a window in or out", "### Scratchpad"),
+        ("screentime-kwin", "rice-screentime", "Screen Time window reporter", "Tells Screen Time which app is focused", "## Screen Time"),
+    ]:
+        if want(fid):
+            out.append(F(id=fid, page="windows", title=title, desc=desc, on=kwin_enabled(scr), plugin=scr, help=hlp,
+                         detail="" if not kwin_enabled(scr) or script_loaded(scr) else "enabled but not loaded"))
+    for fid, (f, name, key, label) in SHORTCUTS.items():
+        if want(fid):
+            ttl = {"key-quickmenu": "Quick menu", "key-cheatsheet": "Shortcut cheat sheet",
+                   "key-taskmanager": "Task manager", "key-ricecenter": "Rice Center"}[fid]
+            out.append(F(id=fid, page="windows", title=f"{ttl} ({label})", desc=f"Global shortcut {label}",
+                         on=shortcut_get(fid)))
+    if want("yakuake"):
+        out.append(F(id="yakuake", page="windows", title="Drop-down terminal at login (F12)", desc="Starts Yakuake when you log in",
+                     on=(CFG / "autostart/org.kde.yakuake.desktop").exists(), help="## Drop-down terminal"))
+    if want("topbar"):
+        hide = plasma_eval('panels().forEach(p=>{if(p.location=="top")print(p.hiding)})').strip()
+        out.append(F(id="topbar", page="windows", title="Top bar auto-hide", desc="The bar slides away and returns at the top edge",
+                     on=hide not in ("none", ""), help="## Top bar and dock"))
+
+    # ---- focus & time ----
+    if want("focus"):
+        rc, o = run_bin("rice-focus", "status")
+        out.append(F(id="focus", page="time", title="Focus mode", desc="Pomodoro on the island, DND during focus, slideshow paused",
+                     on=not o.startswith("focus: off"), detail=o if not o.startswith("focus: off") else "",
+                     settings=[{"key": "work", "label": "Focus minutes", "type": "int", "value": 25, "min": 5, "max": 240},
+                               {"key": "break", "label": "Break minutes", "type": "int", "value": 5, "min": 0, "max": 60},
+                               {"key": "rounds", "label": "Rounds (0 = until stopped)", "type": "int", "value": 4, "min": 0, "max": 20}],
+                     local_settings=True, help="## Focus mode"))
+    if want("awake"):
+        rc, o = run_bin("rice-awake", "status")
+        out.append(F(id="awake", page="time", title="Awake", desc="Keep the PC awake: no sleep, screen-off or auto-lock",
+                     on=o.startswith("awake: on"), detail=o.replace("awake: ", "") if o.startswith("awake: on") else "",
+                     settings=[{"key": "hours", "label": "For", "type": "choice", "value": "1",
+                                "options": [["1", "1 hour"], ["2", "2 hours"], ["4", "4 hours"], ["0", "Until turned off"]]}],
+                     local_settings=True, help="## Awake"))
+    if want("standby"):
+        c = readkv(KR / "standby")
+        load_units(["rice-standby.service"])
+        out.append(F(id="standby", page="time", title="StandBy night clock",
+                     desc="On the charger and idle: a dim full-screen clock; any key returns",
+                     on=c.get("enabled", "1") == "1" and unit_on("rice-standby.service"),
+                     settings=[{"key": "after", "label": "Appear after (minutes idle)", "type": "int", "value": int(c.get("after", 3)), "min": 1, "max": 60},
+                               {"key": "hold", "label": "Lock after (minutes)", "type": "int", "value": int(c.get("hold", 30)), "min": 5, "max": 600},
+                               {"key": "lock", "label": "Lock when dismissed", "type": "bool", "value": c.get("lock", "0") == "1"}],
+                     actions=[{"id": "show", "label": "Show now"}], help="## StandBy"))
+    if want("screentime"):
+        c = readkv(KR / "screentime")
+        out.append(unit_feature("screentime", "time", "Screen Time", "Records time per app (local only) for the tray hourglass",
+                                ["rice-screentime.service"], "## Screen Time",
+                                settings=[{"key": "break", "label": "Break reminder", "type": "choice", "value": c.get("break", "0"),
+                                           "options": [["0", "Off"], ["60", "60 min"], ["90", "90 min"], ["120", "2 h"]]},
+                                          {"key": "milestone", "label": "Daily milestones", "type": "choice", "value": c.get("milestone", "0"),
+                                           "options": [["0", "Off"], ["1", "Every hour"], ["2", "Every 2 h"], ["3", "Every 3 h"]]}],
+                                actions=[{"id": "week", "label": "Last 7 days", "output": True},
+                                         {"id": "forget", "label": "Delete all data", "confirm": "Deletes every recorded day.", "danger": True}]))
+    if want("screentime-week"):
+        out.append(unit_feature("screentime-week", "time", "Weekly Screen Time summary", "A notification every Sunday 20:00",
+                                ["rice-screentime-week.timer"], "## Screen Time"))
+
+    # ---- sound & power ----
+    if want("notifysound"):
+        out.append(unit_feature("notifysound", "everyday", "Rice drop sound on notifications", "A soft drop for notifications without their own sound",
+                                ["rice-notify-sound.service"], "## Sounds", section="Sound"))
+    if want("powersave"):
+        out.append(unit_feature("powersave", "power", "Power Saver tie-in", "In Power Saver: slideshow paused, blur and corners off",
+                                ["rice-powersave.service"], "### Power Saver tie-in"))
+    if want("autoprofile"):
+        out.append(unit_feature("autoprofile", "power", "Auto power profile", "Battery → Power Saver, charger → Balanced",
+                                ["rice-autoprofile.service"], "### Auto profile"))
+    if want("bravegpu"):
+        f = H / ".local/share/applications/brave-browser.desktop"
+        out.append(F(id="bravegpu", page="power", title="Brave video on the GPU", desc="Less CPU and battery for video (restart Brave after)",
+                     on=f.exists() and "AcceleratedVideoDecodeLinux" in f.read_text(errors="ignore"), help="### Brave plays video"))
+    if want("chargelimit"):
+        rc, o = run_bin("rice-charge-limit", timeout=10)
+        lim = re.search(r"^limit:\s*(.*)$", o, re.M)
+        out.append(F(id="chargelimit", page="power", kind="actions", title="Battery charge limit",
+                     desc="Stop charging early to slow battery wear (needs your password)", on=None,
+                     detail=" · ".join(l.strip() for l in o.splitlines() if l.startswith(("battery", "limit"))),
+                     actions=[{"id": "on", "label": "Limit to 85 %"}, {"id": "off", "label": "No limit"}], help="### Charge limit"))
+
+    # ---- everyday (QoL) ----
+    for fid, (f, groups, key, kind, vals, default, title, desc, section) in CFG_FEATURES.items():
+        if want(fid):
+            v = kread(f, groups, key, default)
+            if kind == "toggle":
+                out.append(F(id=fid, page="everyday", section=section, title=title, desc=desc, on=v == vals[0]))
+            else:
+                opts = vals
+                cur = v if any(o[0] == v for o in opts) else ("default" if any(o[0] == "default" for o in opts) else v)
+                if not any(o[0] == cur for o in opts):
+                    opts = opts + [[cur, f"{cur} (current)"]]
+                out.append(F(id=fid, page="everyday", section=section, kind="choice", title=title, desc=desc,
+                             value=cur, options=opts))
+    for fid, (title, desc, events) in SOUND_GROUPS.items():
+        if want(fid):
+            on, n = sound_group_state(fid)
+            if n:
+                out.append(F(id=fid, page="everyday", section="Sound", title=title, desc=desc, on=on,
+                             detail="" if kread("kdeglobals", "Sounds", "Enable", "true") != "false"
+                             else "all sounds are off above"))
+    for fid, (prop, key, title, desc) in TOUCH.items():
+        if want(fid):
+            has = bool(touchpads())
+            out.append(F(id=fid, page="everyday", section="Keyboard & touchpad", title=title, desc=desc,
+                         on=touch_get(fid) if has else False, detail="" if has else "no touchpad found"))
+    if want("capslock"):
+        opts = kread("kxkbrc", "Layout", "Options", "")
+        cur = next((c[0] for c in CAPS[1:] if c[0] in opts.split(",")), "")
+        out.append(F(id="capslock", page="everyday", section="Keyboard & touchpad", kind="choice", title="Caps Lock key",
+                     desc="Turn Caps Lock into something useful", value=cur, options=CAPS))
+    if want("baloo"):
+        rc, o = sh(["balooctl6", "status"], timeout=10)
+        out.append(F(id="baloo", page="everyday", section="Privacy & speed", title="File search indexing (Baloo)",
+                     desc="Finds files by content in KRunner and Dolphin; off saves CPU, disk and battery",
+                     on="is running" in o or "Indexer state" in o and "not running" not in o,
+                     detail=(o.splitlines()[1] if len(o.splitlines()) > 1 else "")))
+
+    # ---- maintenance ----
+    if want("updatewatch"):
+        out.append(unit_feature("updatewatch", "maintenance", "Notice after KDE updates", "Runs the health check when KDE packages change",
+                                ["rice-update-watch.path", "rice-update-login.service"], "## After updates"))
+    if want("perf"):
+        out.append(unit_feature("perf", "maintenance", "Monthly speed check", "Logs KWin + Plasma idle CPU once a month",
+                                ["rice-perf.timer"], "## Speed check",
+                                actions=[{"id": "quick", "label": "Quick check now", "output": True}]))
+    if want("gtksync"):
+        out.append(unit_feature("gtksync", "maintenance", "Keep GTK styles in sync", "Rebuild GTK styles when the KDE look changes",
+                                ["rice-gtk.path"], "## GTK apps match"))
+    if want("snapshots"):
+        rc, o = run_bin("rice-backup", "--list")
+        items = []
+        for line in o.splitlines():
+            m = re.match(r"^(\d+-pre-\S+)\s+(\d{4}-\d\d-\d\d \d\d:\d\d)", line.strip())
+            if m:
+                items.append({"name": m.group(1), "date": m.group(2)})
+        out.append(F(id="snapshots", page="backups", kind="list", title="Snapshots",
+                     desc="Saved states of the rice settings. Restoring saves the current state first", on=None,
+                     items=list(reversed(items)),
+                     actions=[{"id": "create", "label": "Snapshot now", "arg": "name"},
+                              {"id": "restore", "label": "Restore", "per_item": True,
+                               "confirm": "Puts these settings back and restarts Plasma for a few seconds. The current state is saved first."}],
+                     help="## Snapshots before you tinker"))
+    if only and not out:
+        raise KeyError(only)
+    return arrange(out)
+
+
+# Sound section reads: master switch, volume pop, each kind of sound, then the extras
+SOUND_ORDER = ["sys-sounds", "vol-feedback"] + list(SOUND_GROUPS) + ["notifysound", "vol-over100", "vol-step"]
+
+
+def arrange(fs):
+    """Keep each page's sections together (in order of first appearance) and order the Sound section."""
+    out, seen = [], {}
+    for f in fs:
+        key = (f["page"], f.get("section", ""))
+        if key not in seen:
+            seen[key] = []
+            out.append(seen[key])
+        seen[key].append(f)
+    for group in out:
+        if group and group[0].get("section") == "Sound":
+            group.sort(key=lambda f: SOUND_ORDER.index(f["id"]) if f["id"] in SOUND_ORDER else 99)
+    return [f for g in out for f in g]
+
+
+def feature(fid):
+    return build(fid)[0]
+
+
+# ------------------------------------------------------------------------------------------- changes
+def turn(fid, on):
+    f = feature(fid)
+    if "units" in f and f["kind"] in ("toggle", "report"):
+        units_set(f["units"], on)
+        if fid == "screentime" and on:
+            pass
+        return
+    if "plugin" in f:
+        (effect_set if f["page"] == "look" else script_set)(f["plugin"], on)
+        return
+    if fid in SHORTCUTS:
+        shortcut_set(fid, on)
+        return
+    if fid in CFG_FEATURES:
+        cfg_set(fid, CFG_FEATURES[fid][4][0 if on else 1])
+        return
+    if fid in TOUCH:
+        touch_set(fid, on)
+        return
+    if fid in SOUND_GROUPS:
+        sound_group_set(fid, on)
+        return
+    if fid == "baloo":
+        sh(["balooctl6", "enable" if on else "disable"], timeout=30, check=True)
+        return
+    if fid == "scheme":
+        sh(["plasma-apply-colorscheme", "MidnightBlue" if on else "BreezeDark"], check=True)
+    elif fid == "plasmastyle":
+        sh(["plasma-apply-desktoptheme", "rice" if on else "default"], check=True)
+    elif fid == "gtk":
+        run_bin("rice-gtk", "on" if on else "off")
+    elif fid == "splash":
+        kwrite("ksplashrc", "KSplash", "Theme", "org.rice.splash" if on else "org.kde.breeze.desktop")
+    elif fid == "yakuake":
+        a = CFG / "autostart/org.kde.yakuake.desktop"
+        parked = KR / "disabled/org.kde.yakuake.desktop"
+        if on:
+            a.parent.mkdir(parents=True, exist_ok=True)
+            src = parked if parked.exists() else pathlib.Path("/usr/share/applications/org.kde.yakuake.desktop")
+            sh(["cp", "-a", str(src), str(a)], check=True)
+        elif a.exists():
+            parked.parent.mkdir(parents=True, exist_ok=True)
+            a.replace(parked)
+    elif fid == "topbar":
+        if feature("topbar")["on"] != on:
+            run_bin("toggle-topbar")
+    elif fid == "focus":
+        if on:
+            s = OPTS
+            run_bin("rice-focus", "on", str(s.get("work", 25)), str(s.get("break", 5)), str(s.get("rounds", 4)))
+        else:
+            run_bin("rice-focus", "off")
+    elif fid == "awake":
+        run_bin("rice-awake", "on", str(OPTS.get("hours", 1))) if on else run_bin("rice-awake", "off")
+    elif fid == "standby":
+        run_bin("rice-standby", "on" if on else "off")
+        units_set(["rice-standby.service"], True) if on else None
+    elif fid == "bravegpu":
+        run_bin("rice-brave-gpu", *([] if on else ["undo"]))
+    elif fid == "lite":
+        if on:
+            CACHE.mkdir(parents=True, exist_ok=True)
+            LITE_FLAG.touch()
+            for e in ("blur", "kwin4_effect_shapecorners", "rice-tide"):
+                dcall("org.kde.KWin", "/Effects", "org.kde.kwin.Effects", "unloadEffect", e)
+        else:
+            LITE_FLAG.unlink(missing_ok=True)
+            for e in ("blur", "kwin4_effect_shapecorners", "rice-tide"):
+                if kwin_enabled(e):
+                    dcall("org.kde.KWin", "/Effects", "org.kde.kwin.Effects", "loadEffect", e)
+    else:
+        raise RuntimeError(f"{fid} can't be turned on/off")
+
+
+def set_value(fid, key, value):
+    if fid == "look":
+        return look_switch(value, layout=OPTS.get("layout") in ("1", "true"))
+    if fid == "mood":
+        return run_bin("rice-mood", value, timeout=60)[1]
+    if fid in CFG_FEATURES:
+        if not any(o[0] == value for o in CFG_FEATURES[fid][4]):
+            raise RuntimeError(f"{value} is not an option")
+        cfg_set(fid, value)
+        return ""
+    if fid == "capslock":
+        if not any(c[0] == value for c in CAPS):
+            raise RuntimeError("not an option")
+        opts = [o for o in kread("kxkbrc", "Layout", "Options", "").split(",") if o and not o.startswith(("caps:", "ctrl:nocaps"))]
+        if value:
+            opts.append(value)
+        if opts:
+            kwrite("kxkbrc", "Layout", "Options", ",".join(opts))
+            kwrite("kxkbrc", "Layout", "ResetOldOptions", True)
+        else:                              # nothing left: back to no override at all
+            kwrite("kxkbrc", "Layout", "Options", None)
+            kwrite("kxkbrc", "Layout", "ResetOldOptions", None)
+        reload_cfg("kxkbrc")
+        return ""
+    if fid == "sounds":
+        kwrite("kdeglobals", "Sounds", "Theme", value)
+        return ""
+    if fid == "standby":
+        if key == "lock":
+            return run_bin("rice-standby", "set", "lock", "on" if value in ("1", "true", "on") else "off")[1]
+        return run_bin("rice-standby", "set", key, value)[1]
+    if fid == "screentime":
+        return run_bin("rice-screentime", "set", key, value)[1]
+    raise RuntimeError(f"{fid} has no setting {key}")
+
+
+def action(fid, act, arg=None):
+    if fid == "look" and act in ("rice", "stock", "original"):
+        return look_switch(act, layout=OPTS.get("layout") in ("1", "true"))
+    if fid == "doctor":
+        rc, o = run_bin("rice-doctor", "-q", timeout=90)
+        CACHE.mkdir(parents=True, exist_ok=True)
+        DOCTOR_CACHE.write_text(f"{rc}\n{time.strftime('%H:%M')}\n{o}")
+        return run_bin("rice-doctor", timeout=90)[1] if act == "full" else ""
+    if fid == "quick":
+        if act == "restart-plasma":
+            restart_plasma(); return "Plasma restarted"
+        if act == "usage":
+            detach(["xdg-open", str(USAGE)]); return ""
+        if act == "ideas":
+            detach(["xdg-open", str(H / "Desktop/kde-rice-ideas.md")]); return ""
+        if act == "folder":
+            detach(["dolphin", str(RICE)]); return ""
+        if act == "sync":
+            rc, o = sh([str(H / "Documents/Code/kde-rice/scripts/export-from-live.sh")], timeout=300)
+            return ("done" if rc == 0 else "FAILED") + "\n" + o
+    if fid == "lockscreen" and act == "rebuild":
+        return run_bin("rice-lockscreen", "--force")[1]
+    if fid == "daynight" and act == "repick":
+        return run_bin("daynight-wallpaper", "--force")[1]
+    if fid == "standby" and act == "show":
+        detach([str(BIN / "rice-standby"), "show"]); return ""
+    if fid == "screentime":
+        if act == "week":
+            return run_bin("rice-screentime", "week")[1]
+        if act == "forget":
+            return run_bin("rice-screentime", "forget")[1]
+    if fid == "perf" and act == "quick":
+        return run_bin("rice-perf", "--quick", timeout=60)[1]
+    if fid == "chargelimit":
+        konsole(f"{shlex.quote(str(BIN / 'rice-charge-limit'))} {'on' if act == 'on' else 'off'}")
+        return "opened Konsole (asks for your password)"
+    if fid == "snapshots":
+        if act == "create":
+            name = re.sub(r"[^a-z0-9-]+", "-", (arg or "manual").lower()).strip("-")[:40] or "manual"
+            return run_bin("rice-backup", name, timeout=120)[1]
+        if act == "restore":
+            if not arg or not re.match(r"^\d+-pre-[A-Za-z0-9_.-]+$", arg):
+                raise RuntimeError("pick a snapshot")
+            script = RICE / "backups" / arg / "restore-this-state.sh"
+            if not script.exists():
+                raise RuntimeError(f"{arg} has no restore script")
+            sh(["systemctl", "--user", "stop", "plasma-plasmashell.service"], timeout=30)
+            rc, o = sh(["bash", str(script)], timeout=180)
+            sh(["systemctl", "--user", "start", "plasma-plasmashell.service"], timeout=30)
+            dcall("org.kde.KWin", "/KWin", "org.kde.KWin", "reconfigure")
+            return o
+    raise RuntimeError(f"unknown action {fid}/{act}")
+
+
+def help_text(fid):
+    f = feature(fid)
+    head = f.get("help") or ""
+    if not head:
+        return f"**{f['title']}**\n\n{f['desc']}"
+    lines = USAGE.read_text().splitlines()
+    level = len(head) - len(head.lstrip("#"))
+    for i, l in enumerate(lines):
+        if l.startswith(head):
+            body = [l]
+            for m in lines[i + 1:]:
+                if re.match(r"^#{1,%d} " % level, m):
+                    break
+                body.append(m)
+            return "\n".join(body).strip()
+    return f"**{f['title']}**\n\n{f['desc']}"
+
+
+# ------------------------------------------------------------------------------------------- CLI
+OPTS = {}
+
+
+def public(f):
+    return {k: v for k, v in f.items() if k not in ("units", "plugin")}
+
+
+def emit(obj):
+    print(json.dumps(obj, ensure_ascii=False))
+
+
+def main():
+    a = sys.argv[1:]
+    # --opt key=value pass-through (focus minutes, awake hours, ...)
+    while "--opt" in a:
+        i = a.index("--opt")
+        k, _, v = a[i + 1].partition("=")
+        OPTS[k] = v
+        del a[i:i + 2]
+    cmd = a[0] if a else "list"
+    try:
+        if cmd == "list":
+            fs = build()
+            if "--json" in a:
+                emit([public(f) for f in fs])
+            else:
+                for f in fs:
+                    st = {True: "on ", False: "off", None: "   "}[f.get("on")]
+                    val = f" [{f['value']}]" if f.get("value") not in (None, "") else ""
+                    print(f"{st} {f['page']:<12} {f['id']:<18} {f['title']}{val}")
+        elif cmd == "get":
+            emit(public(feature(a[1])))
+        elif cmd in ("on", "off"):
+            turn(a[1], cmd == "on")
+            _units.clear()
+            emit({"ok": True, "feature": public(feature(a[1]))})
+        elif cmd == "set":
+            fid, rest = a[1], a[2:]
+            key, value = (rest[0], rest[1]) if len(rest) == 2 else ("value", rest[0])
+            msg = set_value(fid, key, value)
+            _units.clear()
+            emit({"ok": True, "output": msg or "", "feature": public(feature(fid))})
+        elif cmd == "action":
+            msg = action(a[1], a[2], a[3] if len(a) > 3 else None)
+            _units.clear()
+            emit({"ok": True, "output": msg or "", "feature": public(feature(a[1]))})
+        elif cmd == "help":
+            print(help_text(a[1]))
+        elif cmd == "look":
+            print(look_switch(a[1], layout="--layout" in a))
+        elif cmd in ("-h", "--help"):
+            print("\n".join(l[2:] for l in open(__file__).read().splitlines()[1:12]))
+        else:
+            raise RuntimeError(f"unknown command {cmd}")
+    except KeyError as e:
+        emit({"ok": False, "error": f"unknown feature {e}"}); sys.exit(2)
+    except Exception as e:
+        emit({"ok": False, "error": str(e)}); sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18 @@
+#!/bin/sh
+# kde-rice: Rice Center - the desktop app that manages every rice feature (bin/center/main.qml).
+#   rice-center                  open it (or bring the open window to the front)
+#   rice-center --shot F [page]  render the window to F (PNG) and quit (for checks)
+# All changes go through ~/kde-rice/bin/rice-ctl.
+QML="$(dirname "$(readlink -f "$0")")/center/main.qml"
+if [ "${1:-}" != "--shot" ] && pgrep -f "qml-qt6 .*$QML" >/dev/null; then
+  # already open: raise it with a one-shot KWin script
+  js="${XDG_RUNTIME_DIR:-/tmp}/rice-center-raise.js"
+  echo 'workspace.windowList().forEach(w => { if (w.caption === "Rice Center") { w.minimized = false; workspace.activeWindow = w; } });' > "$js"
+  qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript rice-center-raise >/dev/null 2>&1
+  id=$(qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.loadScript "$js" rice-center-raise) &&
+    qdbus6 org.kde.KWin "/Scripting/Script$id" org.kde.kwin.Script.run >/dev/null 2>&1
+  sleep 0.3; qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript rice-center-raise >/dev/null 2>&1
+  exit 0
+fi
+export QT_QUICK_CONTROLS_STYLE=org.kde.desktop
+exec qml-qt6 --apptype widget "$QML" -- "$@"
