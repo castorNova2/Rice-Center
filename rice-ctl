@@ -602,6 +602,13 @@ def build(only=None):
         out.append(F(id="gtk", page="look", title="GTK apps match KDE",
                      desc="GNOME-style apps and Flatpaks get the KDE colours, window buttons and frame",
                      on="matches KDE" in o, help="## GTK apps match"))
+    if want("bravetheme"):
+        rc, o = run_bin("rice-brave-theme", "status")
+        out.append(F(id="bravetheme", page="look", kind="actions", title="Brave matches the rice", on=None,
+                     desc="Browser frame, tabs and toolbar in the KDE colours (load once on brave://extensions)",
+                     detail=o.strip().split(" (")[0],
+                     actions=[{"id": "rebuild", "label": "Rebuild + show steps", "output": True},
+                              {"id": "folder", "label": "Theme folder"}], help="## Brave theme"))
     if want("splash"):
         sp = kread("ksplashrc", "KSplash", "Theme", "")
         out.append(F(id="splash", page="look", title="Rice login splash", desc="Blurred wallpaper, clock and greeting while logging in",
@@ -653,6 +660,11 @@ def build(only=None):
                    "key-taskmanager": "Task manager", "key-ricecenter": "Rice Center"}[fid]
             out.append(F(id=fid, page="windows", title=f"{ttl} ({label})", desc=f"Global shortcut {label}",
                          on=shortcut_get(fid)))
+    if want("hyprkeys"):
+        rc, o = run_bin("rice-keys", "status")
+        out.append(F(id="hyprkeys", page="windows", title="Hyprland-style keys",
+                     desc="Meta+Enter Konsole · Meta+Q close window · Meta+Shift+S region screenshot (Meta+E, Meta+V already default)",
+                     on=o.strip().endswith("on"), detail="" if rc == 0 else o.strip()[-200:], help="### Hyprland-style keys"))
     if want("yakuake"):
         out.append(F(id="yakuake", page="windows", title="Drop-down terminal at login (F12)", desc="Starts Yakuake when you log in",
                      on=(CFG / "autostart/org.kde.yakuake.desktop").exists(), help="## Drop-down terminal"))
@@ -845,6 +857,8 @@ def turn(fid, on):
         sh(["plasma-apply-desktoptheme", "rice" if on else "default"], check=True)
     elif fid == "gtk":
         run_bin("rice-gtk", "on" if on else "off")
+    elif fid == "hyprkeys":
+        run_bin("rice-keys", "on" if on else "off")
     elif fid == "splash":
         kwrite("ksplashrc", "KSplash", "Theme", "org.rice.splash" if on else "org.kde.breeze.desktop")
     elif fid == "yakuake":
@@ -944,6 +958,11 @@ def action(fid, act, arg=None):
         if act == "sync":
             rc, o = sh([str(H / "Documents/Code/kde-rice/scripts/export-from-live.sh")], timeout=300)
             return ("done" if rc == 0 else "FAILED") + "\n" + o
+    if fid == "bravetheme":
+        if act == "rebuild":
+            return run_bin("rice-brave-theme")[1]
+        if act == "folder":
+            detach(["dolphin", run_bin("rice-brave-theme", "path")[1].strip()]); return ""
     if fid == "lockscreen" and act == "rebuild":
         return run_bin("rice-lockscreen", "--force")[1]
     if fid == "daynight" and act == "repick":
