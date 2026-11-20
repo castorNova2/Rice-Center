@@ -665,6 +665,14 @@ def build(only=None):
         out.append(F(id="hyprkeys", page="windows", title="Hyprland-style keys",
                      desc="Meta+Enter Konsole · Meta+Q close window · Meta+Shift+S region screenshot (Meta+E, Meta+V already default)",
                      on=o.strip().endswith("on"), detail="" if rc == 0 else o.strip()[-200:], help="### Hyprland-style keys"))
+    if want("activities"):
+        rc, o = run_bin("rice-activities", "status")
+        out.append(F(id="activities", page="windows", title="Activities: Work / Study / Chill",
+                     desc="Meta+Tab switches. Same wallpaper mood; Work + Study desks show only the clock; dock shows this activity's windows",
+                     on=o.strip().endswith("on"), detail=" · ".join(l.strip() for l in o.splitlines()[:-1]) if rc == 0 else o.strip()[-200:],
+                     actions=[{"id": "go-Work", "label": "Go to Work"}, {"id": "go-Study", "label": "Go to Study"},
+                              {"id": "go-Chill", "label": "Go to Chill"}, {"id": "fix", "label": "Re-apply desks"}],
+                     help="### Activities (Work / Study / Chill)"))
     if want("yakuake"):
         out.append(F(id="yakuake", page="windows", title="Drop-down terminal at login (F12)", desc="Starts Yakuake when you log in",
                      on=(CFG / "autostart/org.kde.yakuake.desktop").exists(), help="## Drop-down terminal"))
@@ -859,6 +867,8 @@ def turn(fid, on):
         run_bin("rice-gtk", "on" if on else "off")
     elif fid == "hyprkeys":
         run_bin("rice-keys", "on" if on else "off")
+    elif fid == "activities":
+        run_bin("rice-activities", "on" if on else "off")
     elif fid == "splash":
         kwrite("ksplashrc", "KSplash", "Theme", "org.rice.splash" if on else "org.kde.breeze.desktop")
     elif fid == "yakuake":
@@ -963,6 +973,11 @@ def action(fid, act, arg=None):
             return run_bin("rice-brave-theme")[1]
         if act == "folder":
             detach(["dolphin", run_bin("rice-brave-theme", "path")[1].strip()]); return ""
+    if fid == "activities":
+        if act == "fix":
+            return run_bin("rice-activities", "fix")[1]
+        if act.startswith("go-"):
+            return run_bin("rice-activities", "go", act[3:])[1]
     if fid == "lockscreen" and act == "rebuild":
         return run_bin("rice-lockscreen", "--force")[1]
     if fid == "daynight" and act == "repick":
